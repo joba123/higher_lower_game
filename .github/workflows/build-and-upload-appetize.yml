@@ -1,0 +1,159 @@
+name: Build and Upload to Appetize
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: build-and-upload-appetize-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-upload:
+    name: Build debug APK and upload to Appetize
+    runs-on: ubuntu-latest
+    env:
+      APPETIZE_API_TOKEN: ${{ secrets.APPETIZE_API_TOKEN }}
+      APPETIZE_API_BASE_URL: https://api.appetize.io/v1/apps
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug
+
+      - name: Find debug APK
+        id: find_apk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          apk_path="$(find . -type f -path '*/build/outputs/apk/debug/*.apk' ! -name '*androidTest*' | sort | head -n 1)"
+          if [[ -z "${apk_path}" ]]; then
+            echo "No debug APK found under */build/outputs/apk/debug/." >&2
+            exit 1
+          fi
+
+          echo "Found debug APK: ${apk_path}"
+          echo "apk_path=${apk_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: ${{ steps.find_apk.outputs.apk_path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Restore cached Appetize app public key
+        id: restore_appetize_key
+        uses: actions/cache/restore@v4
+        with:
+          path: .appetize/public-key
+          key: appetize-public-key-${{ github.repository_id }}-${{ github.run_id }}
+          restore-keys: |
+            appetize-public-key-${{ github.repository_id }}-
+
+      - name: Upload APK to Appetize
+        id: upload_appetize
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${APPETIZE_API_TOKEN}" ]]; then
+            echo "APPETIZE_API_TOKEN secret is not configured or is unavailable to this workflow run." >&2
+            exit 1
+          fi
+
+          apk_path="${{ steps.find_apk.outputs.apk_path }}"
+          response_file="$(mktemp)"
+          mkdir -p .appetize
+
+          upload_app() {
+            local endpoint="$1"
+            curl --silent --show-error \
+              --write-out "%{http_code}" \
+              --output "${response_file}" \
+              --request POST "${endpoint}" \
+              --header "X-API-KEY: ${APPETIZE_API_TOKEN}" \
+              --form "file=@${apk_path}" \
+              --form "platform=android" \
+              --form "fileType=apk" \
+              --form "note=Uploaded by GitHub Actions from ${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+              --form "appPermissions.run=public"
+          }
+
+          existing_public_key=""
+          if [[ -s .appetize/public-key ]]; then
+            existing_public_key="$(tr -d '[:space:]' < .appetize/public-key)"
+          fi
+
+          if [[ -n "${existing_public_key}" ]]; then
+            echo "Updating existing Appetize app: ${existing_public_key}"
+            http_status="$(upload_app "${APPETIZE_API_BASE_URL}/${existing_public_key}")"
+
+            if [[ ! "${http_status}" =~ ^2 ]]; then
+              echo "Appetize update returned HTTP ${http_status}. Response:" >&2
+              cat "${response_file}" >&2
+
+              if [[ "${http_status}" == "404" ]]; then
+                echo "Cached Appetize app was not found; creating a new Appetize app instead."
+                http_status="$(upload_app "${APPETIZE_API_BASE_URL}")"
+              fi
+            fi
+          else
+            echo "No cached Appetize public key found; creating a new Appetize app."
+            http_status="$(upload_app "${APPETIZE_API_BASE_URL}")"
+          fi
+
+          if [[ ! "${http_status}" =~ ^2 ]]; then
+            echo "Appetize upload failed with HTTP ${http_status}. Response:" >&2
+            cat "${response_file}" >&2
+            exit 1
+          fi
+
+          public_key="$(jq -r '.publicKey // .public_key // empty' "${response_file}")"
+          public_url="$(jq -r '.publicURL // .publicUrl // .public_url // empty' "${response_file}")"
+
+          if [[ -z "${public_key}" ]]; then
+            echo "Appetize response did not include a publicKey. Response:" >&2
+            cat "${response_file}" >&2
+            exit 1
+          fi
+
+          if [[ -z "${public_url}" ]]; then
+            public_url="https://appetize.io/app/${public_key}"
+          fi
+
+          printf '%s\n' "${public_key}" > .appetize/public-key
+          echo "public_key=${public_key}" >> "${GITHUB_OUTPUT}"
+          echo "public_url=${public_url}" >> "${GITHUB_OUTPUT}"
+          echo "APPETIZE_PUBLIC_URL=${public_url}" >> "${GITHUB_ENV}"
+
+          echo "Appetize public URL: ${public_url}"
+          echo "::notice title=Appetize public URL::${public_url}"
+
+      - name: Cache Appetize app public key
+        if: ${{ success() && steps.upload_appetize.outputs.public_key != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .appetize/public-key
+          key: appetize-public-key-${{ github.repository_id }}-${{ steps.upload_appetize.outputs.public_key }}-${{ github.run_id }}
